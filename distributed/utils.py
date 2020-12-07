@@ -1561,3 +1561,34 @@ def clean_dashboard_address(addr, default_listen_ip=""):
         port = addr
 
     return {"address": host, "port": port}
+
+
+import selectors
+
+class TimedSelector(selectors.BaseSelector):
+    def __init__(self, wrapped : selectors.BaseSelector, on_time):
+        self._wrapped = wrapped
+        self._on_time = on_time
+
+    def select(self, timeout):
+        t = time()
+        r = self._wrapped.select(timeout)
+        t2 = time()
+        self._on_time((t,t2))
+        return r
+
+    def register(self, fileobj, events, data):
+        return self._wrapped.register(fileobj, events, data)
+
+    def unregister(self, fileobj):
+        return self._wrapped.unregister(fileobj)
+
+    def get_map(self):
+        return self._wrapped.get_map()
+
+    def close(self):
+        self._wrapped.close()
+
+
+
+

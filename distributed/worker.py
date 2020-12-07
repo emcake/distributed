@@ -180,6 +180,13 @@ class TaskState:
         nbytes = self.nbytes
         return nbytes if nbytes is not None else DEFAULT_DATA_SIZE
 
+    def is_coro(self) -> bool:
+        if self.runspec is not None:
+            fn = self.runspec[0]
+            if fn is not None:
+                return iscoroutinefunction(fn)
+        return False
+
 
 class Worker(ServerNode):
     """Worker node in a Dask distributed cluster
@@ -426,6 +433,7 @@ class Worker(ServerNode):
         self.ready = list()
         self.constrained = deque()
         self.executing_count = 0
+        self.executing_coroutines = 0
         self.executed_count = 0
         self.long_running = set()
 
@@ -609,6 +617,25 @@ class Worker(ServerNode):
 
         self.actors = {}
         self.loop = loop or IOLoop.current()
+        self.aioloop = None
+
+        if hasattr(self.loop, 'asyncio_loop'):
+            self.aioloop = self.loop.asyncio_loop
+        elif isinstance(self.loop, asyncio.BaseEventLoop):
+            self.aioloop = self.loop
+
+        if self.aioloop and isinstance(self.aioloop, asyncio.selector_events.BaseSelectorEventLoop) :
+
+            self.loop_select_timings = deque(maxlen=1000)
+
+            from typing import cast
+
+            bsel = cast(asyncio.selector_events.BaseSelectorEventLoop, self.aioloop)
+
+            from .utils import TimedSelector
+
+            bsel._selector = TimedSelector(bsel._selector, lambda t: self.loop_select_timings.append(t))
+
         self.reconnect = reconnect
         self.executor = executor or ThreadPoolExecutor(
             self.nthreads, thread_name_prefix="Dask-Worker-Threads'"
@@ -749,7 +776,7 @@ class Worker(ServerNode):
     ##################
 
     def __repr__(self):
-        return "<%s: %r, %s, %s, stored: %d, running: %d/%d, ready: %d, comm: %d, waiting: %d>" % (
+        return "<%s: %r, %s, %s, stored: %d, running: %d/%d, coro: %d, ready: %d, comm: %d, waiting: %d>" % (
             self.__class__.__name__,
             self.address,
             self.name,
@@ -757,6 +784,7 @@ class Worker(ServerNode):
             len(self.data),
             self.executing_count,
             self.nthreads,
+            self.executing_coroutines,
             len(self.ready),
             self.in_flight_tasks,
             self.waiting_for_data_count,
@@ -790,6 +818,10 @@ class Worker(ServerNode):
 
     async def get_metrics(self):
         now = time()
+        if self.loop_select_timings:
+            load = await self.loop.run_in_executor(self.executor, lambda: _calc_event_load(self.loop_select_timings, now))
+        else:
+            load = self.executing_coroutines
         core = dict(
             in_memory=len(self.data),
             ready=len(self.ready),
@@ -804,6 +836,7 @@ class Worker(ServerNode):
                 for key in self.active_threads.values()
                 if key in self.tasks
             },
+            event_loop_load=load
         )
         custom = {}
         for k, metric in self.metrics.items():
@@ -1674,7 +1707,8 @@ class Worker(ServerNode):
                     for dep in ts.dependencies
                 )
 
-            self.executing_count += 1
+            self.add_executing_count(ts)
+            
             self.loop.add_callback(self.execute, ts.key)
         except Exception as e:
             logger.exception(e)
@@ -1708,7 +1742,7 @@ class Worker(ServerNode):
                     self.available_resources[resource] += quantity
 
             if ts.state == "executing":
-                self.executing_count -= 1
+                self.release_executing_count(ts)
                 self.executed_count += 1
             elif ts.state == "long-running":
                 self.long_running.remove(ts.key)
@@ -1751,7 +1785,8 @@ class Worker(ServerNode):
             if self.validate:
                 assert ts.state == "executing"
 
-            self.executing_count -= 1
+            self.release_executing_count(ts)
+
             self.long_running.add(ts.key)
             self.batched_stream.send(
                 {
@@ -2276,7 +2311,7 @@ class Worker(ServerNode):
                 del self.threads[key]
 
             if ts.state == "executing":
-                self.executing_count -= 1
+                self.release_executing_count(ts)
 
             if ts.resource_restrictions is not None:
                 if ts.state == "executing":
@@ -2329,6 +2364,18 @@ class Worker(ServerNode):
     ################
     # Execute Task #
     ################
+
+    def add_executing_count(self, ts):
+        if ts.is_coro():
+            self.executing_coroutines += 1
+        else:
+            self.executing_count += 1
+
+    def release_executing_count(self, ts):
+        if ts.is_coro():
+            self.executing_coroutines -= 1
+        else:
+            self.executing_count -= 1
 
     # FIXME: this breaks if changed to async def...
     # xref: https://github.com/dask/distributed/issues/3938
@@ -2436,6 +2483,7 @@ class Worker(ServerNode):
 
     def meets_resource_constraints(self, key):
         ts = self.tasks[key]
+
         if not ts.resource_restrictions:
             return True
         for resource, needed in ts.resource_restrictions.items():
@@ -2502,7 +2550,9 @@ class Worker(ServerNode):
                         ts.runspec = self._maybe_deserialize_task(ts)
                     except Exception:
                         continue
+                    
                     self.transition(ts, "executing")
+                        
         except Exception as e:
             logger.exception(e)
             if LOG_PDB:
@@ -2552,20 +2602,23 @@ class Worker(ServerNode):
             )  # TODO: comment out?
             assert key == ts.key
             try:
-                result = await self.executor_submit(
-                    ts.key,
-                    apply_function,
-                    args=(
-                        function,
-                        args2,
-                        kwargs2,
-                        self.execution_state,
+                if ts.is_coro():
+                    result = await apply_coroutine(function, args2, kwargs2, self.scheduler_delay)
+                else:
+                    result = await self.executor_submit(
                         ts.key,
-                        self.active_threads,
-                        self.active_threads_lock,
-                        self.scheduler_delay,
-                    ),
-                )
+                        apply_function,
+                        args=(
+                            function,
+                            args2,
+                            kwargs2,
+                            self.execution_state,
+                            ts.key,
+                            self.active_threads,
+                            self.active_threads_lock,
+                            self.scheduler_delay,
+                        ),
+                    )
             except RuntimeError as e:
                 executor_error = e
                 raise
@@ -2578,7 +2631,10 @@ class Worker(ServerNode):
             ts.startstops.append(
                 {"action": "compute", "start": result["start"], "stop": result["stop"]}
             )
-            self.threads[ts.key] = result["thread"]
+            if 'thread' in result:
+                self.threads[ts.key] = result["thread"]
+            else:
+                self.threads[ts.key] = -(hash(ts.key) % 100)
 
             if result["op"] == "task-finished":
                 ts.nbytes = result["nbytes"]
@@ -3387,6 +3443,40 @@ def warn_dumps(obj, dumps=pickle.dumps, limit=1e6):
         )
     return b
 
+async def apply_coroutine(
+    function, 
+    args, 
+    kwargs,
+    time_delay
+):
+    """Run a coroutine and collect information
+    
+    Returns
+    -------
+    msg: dictionary with status, result/error, timings, etc..
+    """
+    start = time()
+    try:
+        result = await function(*args, **kwargs)
+    except Exception as e:
+        msg = error_message(e)
+        msg["op"] = "task-erred"
+        msg["actual-exception"] = e
+    else:
+        msg = {
+            "op": "task-finished",
+            "status": "OK",
+            "result": result,
+            "nbytes": sizeof(result),
+            "type": type(result) if result is not None else None,
+        }
+    finally:
+        end = time()
+    msg["start"] = start + time_delay
+    msg["stop"] = end + time_delay
+    return msg
+
+
 
 def apply_function(
     function,
@@ -3524,6 +3614,33 @@ def convert_kwargs_to_str(kwargs, max_len=None):
 
 def weight(k, v):
     return sizeof(v)
+
+def _calc_event_load(timings, now):
+    """
+    Calculate how busy our event loop is.
+
+    Provided with a list of times where the event loop was waiting for work 
+    and the current time, calculate a load factor from 0 to 1. We sum the times 
+    waiting and take the outer range of times (earliest observed time, now) to
+    get the ratio of time waiting between 0 and 1. We then subtract this from 1 
+    so that higher is 'more loaded'.
+    """
+    earliest = now
+    select_time = 0
+    for t in timings:
+        (s,e) = t
+        earliest = min(earliest,s,e)
+        select_time += e - s
+
+    time_region_covered = now - earliest
+
+    if time_region_covered > 0:
+
+        return 1 - (select_time / time_region_covered)
+
+    else:
+        return 0
+
 
 
 async def run(server, comm, function, args=(), kwargs=None, is_coro=None, wait=True):
